@@ -8,15 +8,9 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <style>
-  /* モバイルの引っ張り更新による意図しない再読み込みを抑止する */
   html, body { overscroll-behavior-y: contain; }
 </style>
 <script>
-// ============================================================
-// 共有データベース(Firebase Realtime Database)
-// 学生用・教員用の双方に同じURLを設定することで、提出物・生成過程・
-// 台帳・閲覧記録が利用者間で共有される。
-// ============================================================
 window.__SYNC_URL__ = "https://writing5-default-rtdb.firebaseio.com";
 window.__ROLE__ = "student";
 window.__STANDALONE__ = true;
@@ -27,13 +21,13 @@ window.storage = {
 };
 window.onerror = function (msg, src, line) {
   var el = document.getElementById("root");
-  if (el) el.innerHTML = '<div style="padding:2rem;font-family:sans-serif;color:#b91c1c;">エラーが発生しました:<br>' + msg + ' (line ' + line + ')<br><small>この画面のスクリーンショットを開発者に共有してください。</small></div>';
+  if (el) el.innerHTML = '<div style="padding:2rem;font-family:sans-serif;color:#b91c1c;">エラーが発生しました:<br>' + msg + ' (line ' + line + ')</div>';
 };
 </script>
 </head>
 <body class="bg-stone-50">
 <noscript><div style="padding:2rem;font-family:sans-serif;">このアプリの動作にはJavaScriptが必要です。Safari / Chrome で開いてください。</div></noscript>
-<div id="root"><div style="padding:3rem 1.5rem;font-family:sans-serif;color:#78716c;text-align:center;">読み込み中です…<br><small>この表示のまま変わらない場合は、インターネット接続を確認し、Safari や Chrome などのブラウザで直接開いてください。</small></div></div>
+<div id="root"><div style="padding:3rem 1.5rem;font-family:sans-serif;color:#78716c;text-align:center;">読み込み中です…</div></div>
 <script>
 const {
   useState,
@@ -399,7 +393,7 @@ async function callGeminiSearch(query, settings) {
         body: JSON.stringify({
           contents: [{
             parts: [{
-              text: "「" + query + "」についてGoogle検索を実行し、検索結果をできるだけ多く(可能なら15件以上)JSON配列のみで返してください。" + '各要素は {"title": "ページタイトル", "link": "実際のページのURL", "snippet": "内容の要約(日本語で2〜3文)"} の形式。' + "linkは必ず http または https で始まる実在のURLにすること。重複は除き、できる限り多様な情報源を含めること。" + "JSON以外の文字、前置き、コードブロック記号は一切出力しないこと。"
+              text: "「" + query + "」についてGoogle検索を実行し、実際に参照した情報源ごとの要約をJSON配列のみで返してください。" + '各要素は {"title": "情報源のサイト名またはページ名", "snippet": "その情報源の内容の要約(日本語で2〜3文)"} の形式。' + "できるだけ多くの情報源(可能なら10件以上)を挙げ、日本語の情報源を優先すること。" + "URLは推測で書かず、実際に参照した情報源についてのみ記述すること。" + "JSON以外の文字、前置き、コードブロック記号は一切出力しないこと。"
             }]
           }],
           tools: [{
@@ -432,47 +426,70 @@ async function callGeminiSearch(query, settings) {
         items = JSON.parse(m[0]);
       } catch (e) {}
     }
+
+    // 検索結果の組み立て方針:
+    // モデルが文章として生成したURLは実在しないことがある(リンク切れ・無関係な
+    // サイトの混入の原因)。そのため、リンクの出所は必ずグラウンディング情報
+    // (Geminiが実際に参照した検索結果)に限定し、モデルの出力は要約文の供給源
+    // としてのみ用いる。要約文はドメイン名の一致でソースへ対応づける。
     const chunks = cand && cand.groundingMetadata && cand.groundingMetadata.groundingChunks || [];
     const sources = chunks.filter(c => c.web && c.web.uri).map(c => ({
-      title: c.web.title || "",
+      title: (c.web.title || "").trim(),
       link: c.web.uri
     }));
+
+    // モデル出力を「サイト名 → 要約文」の対応表にする
+    const snippetByKey = {};
+    (items || []).forEach(it => {
+      if (!it) return;
+      const sn = (it.snippet || "").trim();
+      if (!sn) return;
+      const keys = [];
+      if (it.title) keys.push(String(it.title).trim().toLowerCase());
+      const h = hostLabel(it.link || "");
+      if (h) keys.push(h.toLowerCase());
+      keys.forEach(k => {
+        if (k && !snippetByKey[k]) snippetByKey[k] = sn;
+      });
+    });
+    const lookupSnippet = (title, link) => {
+      const cands = [];
+      if (title) cands.push(title.toLowerCase());
+      const h = hostLabel(link);
+      if (h) cands.push(h.toLowerCase());
+      for (const c of cands) if (snippetByKey[c]) return snippetByKey[c];
+      // 部分一致でも対応づける(「asahi.com」と「朝日新聞デジタル」等のずれを吸収)
+      for (const c of cands) {
+        for (const k of Object.keys(snippetByKey)) {
+          if (k.includes(c) || c.includes(k)) return snippetByKey[k];
+        }
+      }
+      return "";
+    };
     const results = [];
     const seen = {};
     const MAX_RESULTS = 20;
-    const n = Math.max(items.length, sources.length);
-    for (let i = 0; i < n && results.length < MAX_RESULTS; i++) {
-      const it = items[i];
-      if (!it) continue;
-      // モデルが返したURLが妥当ならそれを用いる。妥当でない場合に限り、
-      // 同位置のグラウンディングソースのURLで補う(別情報源の混同を避ける)。
-      const src = sources[i];
-      const title = it.title || src && src.title || "";
-      let link = isValidUrl(it.link) ? it.link : src && src.link || "";
-      if (!title && !link) continue;
-      if (!link) link = googleSearchUrl(title);
-      const key = link || title;
-      if (seen[key]) continue;
-      seen[key] = 1;
-      results.push({
-        title: displayTitle(title, link),
-        link,
-        snippet: it.snippet || ""
-      });
-    }
-    // モデル応答に含まれなかったグラウンディング由来のソースも結果へ追加する
-    // モデル応答に含まれなかった参照ソースも追加する。ただしサイト名すら
-    // 判別できないもの(リダイレクトURLのみ等)は、リンクが露出するだけなので除外する。
     for (let i = 0; i < sources.length && results.length < MAX_RESULTS; i++) {
       const src = sources[i];
       if (!src || !src.link || seen[src.link]) continue;
-      const label = displayTitle(src.title, src.link);
-      if (label === "(タイトル不明)") continue;
       seen[src.link] = 1;
+      const label = src.title || hostLabel(src.link) || "検索結果 " + (results.length + 1);
       results.push({
         title: label,
         link: src.link,
-        snippet: ""
+        snippet: lookupSnippet(src.title, src.link),
+        verified: true // 実際に参照された検索結果(リンクの実在が保証される)
+      });
+    }
+
+    // グラウンディング情報が得られなかった場合に限り、クエリのGoogle検索結果ページを案内する。
+    // モデルが生成しただけのURLは実在が保証されないため、結果としては提示しない。
+    if (results.length === 0 && (items || []).length > 0) {
+      results.push({
+        title: "Googleで「" + query + "」の検索結果を開く",
+        link: googleSearchUrl(query),
+        snippet: "今回は参照元の情報を取得できませんでした。Google検索の結果ページから直接ご確認ください。",
+        verified: false
       });
     }
     if (results.length > 0) return results;
@@ -961,7 +978,7 @@ function SearchResultCard({
     className: "text-sm font-medium text-sky-700 hover:underline break-all"
   }, displayTitle(item.title, item.link)), /*#__PURE__*/React.createElement("p", {
     className: "text-xs text-stone-400 break-all"
-  }, valid ? item.link : "(URL不明のためGoogle検索リンクを使用)"), /*#__PURE__*/React.createElement("p", {
+  }, hostLabel(item.link) || (item.verified === false ? "Google検索の結果ページ" : "Google検索の参照先")), /*#__PURE__*/React.createElement("p", {
     className: "text-xs text-stone-600 mt-1"
   }, item.snippet), /*#__PURE__*/React.createElement("div", {
     className: "flex gap-2 mt-2 flex-wrap"
@@ -2734,6 +2751,7 @@ function App() {
     }
   }));
 }
-ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));</script>
+ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
+</script>
 </body>
 </html>
