@@ -2,11 +2,14 @@
 <html lang="ja">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Knowledge Augmentation and Intelligent Traceability Observatory(教員用)</title>
 <script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<style>
+  html, body { overscroll-behavior-y: contain; }
+</style>
 <script>
 window.__SYNC_URL__ = "https://writing5-default-rtdb.firebaseio.com";
 window.__ROLE__ = "teacher";
@@ -18,13 +21,13 @@ window.storage = {
 };
 window.onerror = function (msg, src, line) {
   var el = document.getElementById("root");
-  if (el) el.innerHTML = '<div style="padding:2rem;font-family:sans-serif;color:#b91c1c;">エラーが発生しました:<br>' + msg + ' (line ' + line + ')<br><small>この画面のスクリーンショットを開発者に共有してください。</small></div>';
+  if (el) el.innerHTML = '<div style="padding:2rem;font-family:sans-serif;color:#b91c1c;">エラーが発生しました:<br>' + msg + ' (line ' + line + ')</div>';
 };
 </script>
 </head>
 <body class="bg-stone-50">
 <noscript><div style="padding:2rem;font-family:sans-serif;">このアプリの動作にはJavaScriptが必要です。Safari / Chrome で開いてください。</div></noscript>
-<div id="root"><div style="padding:3rem 1.5rem;font-family:sans-serif;color:#78716c;text-align:center;">読み込み中です…<br><small>この表示のまま変わらない場合は、インターネット接続を確認し、Safari や Chrome などのブラウザで直接開いてください。</small></div></div>
+<div id="root"><div style="padding:3rem 1.5rem;font-family:sans-serif;color:#78716c;text-align:center;">読み込み中です…</div></div>
 <script>
 const {
   useState,
@@ -62,7 +65,9 @@ const FIXED_ROLE = typeof window !== "undefined" && window.__ROLE__ || null;
 // Firebase Realtime Database の REST API を利用(SDK不要・fetchのみ)。
 // 管理者がHTML冒頭の window.__SYNC_URL__ にDB URLを設定して配布すると、
 // 学生版・教員版が同じデータベースを共有し、複数人での実運用が可能になる。
-let SYNC_URL = "";
+// 配布時に埋め込まれた共有DBのURLは、どのコンポーネントの初期化よりも先に
+// 確定させる必要がある(教員画面の初回読み込みが端末内ストレージを参照するのを防ぐため)。
+let SYNC_URL = typeof window !== "undefined" && typeof window.__SYNC_URL__ === "string" ? window.__SYNC_URL__.trim().replace(/\/+$/, "") : "";
 function setSyncUrl(u) {
   SYNC_URL = (u || "").trim().replace(/\/+$/, "");
 }
@@ -372,98 +377,166 @@ async function submissionContentHash(sub) {
 
 // ---------- ユーティリティ ----------
 // --- 検索: Gemini検索(Google検索グラウンディング / 無料枠) ---
+// ドメイン名を正規化して比較できるようにする
+function normDomain(d) {
+  return String(d || "").trim().toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").split("/")[0].split("?")[0];
+}
+function domainsMatch(a, b) {
+  const x = normDomain(a),
+    y = normDomain(b);
+  if (!x || !y) return false;
+  return x === y || x.endsWith("." + y) || y.endsWith("." + x);
+}
+
+// Gemini検索を1回実行し、「実際に参照された検索結果(リンク)」と
+// 「モデルが付けた見出し・要約」の両方を取得する。
+async function geminiSearchOnce(query, settings, model, instruction) {
+  const url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + encodeURIComponent(settings.geminiKey);
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        contents: [{
+          parts: [{
+            text: instruction
+          }]
+        }],
+        tools: [{
+          google_search: {}
+        }],
+        generationConfig: {
+          maxOutputTokens: 8192
+        }
+      })
+    });
+  } catch (e) {
+    throw new Error("NETWORK_BLOCKED");
+  }
+  let data = {};
+  try {
+    data = await res.json();
+  } catch (e) {}
+  if (data.error) {
+    const err = new Error("Gemini検索: " + (data.error.message || res.status));
+    err.code = data.error.code || res.status;
+    throw err;
+  }
+  const cand = data.candidates && data.candidates[0];
+  const parts = cand && cand.content && cand.content.parts;
+  const text = (parts || []).map(p => p.text || "").join("");
+
+  // モデルが返した見出し・要約(domain をキーにして後でリンクと対応づける)
+  let items = [];
+  const m = text.replace(/```json|```/g, "").match(/\[[\s\S]*\]/);
+  if (m) {
+    try {
+      items = JSON.parse(m[0]) || [];
+    } catch (e) {}
+  }
+  if (!Array.isArray(items)) items = [];
+
+  // 実際に参照された検索結果。web.title にはドメイン名が入る。
+  const chunks = cand && cand.groundingMetadata && cand.groundingMetadata.groundingChunks || [];
+  const sources = chunks.filter(c => c && c.web && c.web.uri).map(c => ({
+    domain: normDomain(c.web.title || ""),
+    link: c.web.uri
+  }));
+  return {
+    items,
+    sources
+  };
+}
+
+// 検索結果の組み立て:
+//  ・リンクは必ずグラウンディング情報(実際に参照された検索結果)から取る → 404や無関係サイトを防ぐ
+//  ・見出しと要約はモデル出力から取り、ドメイン名で両者を突き合わせる
+//  ・結果が少ない場合は観点を変えてもう一度検索し、重複を除いて統合する
 async function callGeminiSearch(query, settings) {
   if (!settings.geminiKey) throw new Error("NO_KEY");
+  const baseInstruction = "「" + query + "」についてGoogle検索を行い、参照した情報源ごとの情報をJSON配列のみで返してください。\n" + '各要素の形式: {"domain": "情報源のドメイン名(例: weblio.jp)", "title": "ページまたはサイトの名称(日本語)", "snippet": "その情報源に書かれている内容の要約(日本語で2〜3文)"}\n' + "・domain には実際に参照したサイトのドメイン名のみを記載すること(URL全体やパスは不要)。\n" + "・title には「weblio.jp」のようなドメイン名ではなく、「Weblio辞書」のような読んで分かる名称を書くこと。\n" + "・snippet は必ず記入し、そのページの内容を具体的に要約すること。\n" + "・できるだけ多く(可能なら10件以上)、多様な情報源を挙げること。日本語の情報源を優先すること。\n" + "・URLは推測して書かないこと。JSON以外の文字、前置き、コードブロック記号は一切出力しないこと。";
+  const extraInstruction = "「" + query + "」について、別の観点(定義・具体例・解説記事・ニュース・統計など)からもGoogle検索を行い、" + "先ほどとは異なる情報源を中心にJSON配列のみで返してください。\n" + '各要素の形式: {"domain": "ドメイン名", "title": "読んで分かる名称(日本語)", "snippet": "内容の要約(日本語で2〜3文)"}\n' + "・title にドメイン名をそのまま書かないこと。snippet は必ず記入すること。\n" + "・JSON以外の文字は一切出力しないこと。";
   const models = Array.from(new Set([settings.geminiModel || "gemini-2.5-flash", "gemini-2.5-flash", "gemini-2.0-flash"]));
+  const results = [];
+  const seenLink = {};
+  const MAX_RESULTS = 20;
   let lastErr = null;
-  for (const model of models) {
-    const url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + encodeURIComponent(settings.geminiKey);
-    let res;
-    try {
-      res = await fetch(url, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          contents: [{
-            parts: [{
-              text: "「" + query + "」についてGoogle検索を実行し、検索結果をできるだけ多く(可能なら15件以上)JSON配列のみで返してください。" + '各要素は {"title": "ページタイトル", "link": "実際のページのURL", "snippet": "内容の要約(日本語で2〜3文)"} の形式。' + "linkは必ず http または https で始まる実在のURLにすること。重複は除き、できる限り多様な情報源を含めること。" + "JSON以外の文字、前置き、コードブロック記号は一切出力しないこと。"
-            }]
-          }],
-          tools: [{
-            google_search: {}
-          }],
-          generationConfig: {
-            maxOutputTokens: 8192
-          }
-        })
-      });
-    } catch (e) {
-      throw new Error("NETWORK_BLOCKED");
-    }
-    let data = {};
-    try {
-      data = await res.json();
-    } catch (e) {}
-    if (data.error) {
-      lastErr = new Error("Gemini検索: " + (data.error.message || res.status));
-      if (data.error.code === 404 || res.status === 404) continue;
-      throw lastErr;
-    }
-    const cand = data.candidates && data.candidates[0];
-    const parts = cand && cand.content && cand.content.parts;
-    const text = (parts || []).map(p => p.text || "").join("");
-    let items = [];
-    const m = text.replace(/```json|```/g, "").match(/\[[\s\S]*\]/);
-    if (m) {
+  let usedModel = null;
+
+  // モデル候補を順に試し、最初に成功したものを使う
+  const runAndCollect = async instruction => {
+    const tryModels = usedModel ? [usedModel] : models;
+    for (const mdl of tryModels) {
       try {
-        items = JSON.parse(m[0]);
-      } catch (e) {}
+        const out = await geminiSearchOnce(query, settings, mdl, instruction);
+        usedModel = mdl;
+        return out;
+      } catch (e) {
+        if (e.message === "NETWORK_BLOCKED") throw e;
+        lastErr = e;
+        if (e.code === 404) continue; // モデル名が無い場合のみ次を試す
+        throw e;
+      }
     }
-    const chunks = cand && cand.groundingMetadata && cand.groundingMetadata.groundingChunks || [];
-    const sources = chunks.filter(c => c.web && c.web.uri).map(c => ({
-      title: c.web.title || "",
-      link: c.web.uri
-    }));
-    const results = [];
-    const seen = {};
-    const MAX_RESULTS = 20;
-    const n = Math.max(items.length, sources.length);
-    for (let i = 0; i < n && results.length < MAX_RESULTS; i++) {
-      const it = items[i];
-      if (!it) continue;
-      // モデルが返したURLが妥当ならそれを用いる。妥当でない場合に限り、
-      // 同位置のグラウンディングソースのURLで補う(別情報源の混同を避ける)。
-      const src = sources[i];
-      const title = it.title || src && src.title || "";
-      let link = isValidUrl(it.link) ? it.link : src && src.link || "";
-      if (!title && !link) continue;
-      if (!link) link = googleSearchUrl(title);
-      const key = link || title;
-      if (seen[key]) continue;
-      seen[key] = 1;
+    return null;
+  };
+  const absorb = out => {
+    if (!out) return;
+    const {
+      items,
+      sources
+    } = out;
+    // 1) 参照された検索結果それぞれに、ドメインが一致するモデル出力を対応づける
+    sources.forEach(src => {
+      if (!src.link || seenLink[src.link] || results.length >= MAX_RESULTS) return;
+      const hit = items.find(it => it && domainsMatch(it.domain || "", src.domain)) || items.find(it => it && domainsMatch(it.domain || "", src.domain || "") && it.title);
+      seenLink[src.link] = 1;
+      const domain = src.domain || normDomain(hit && hit.domain) || "";
+      let title = hit && String(hit.title || "").trim() || "";
+      // 見出しがドメイン名そのものだった場合は、せめて先頭を大文字化して区別できるようにする
+      if (!title || normDomain(title) === domain) title = domain || "検索結果";
       results.push({
-        title: title || link,
-        link,
-        snippet: it.snippet || ""
-      });
-    }
-    // モデル応答に含まれなかったグラウンディング由来のソースも結果へ追加する
-    for (let i = 0; i < sources.length && results.length < MAX_RESULTS; i++) {
-      const src = sources[i];
-      if (!src || !src.link || seen[src.link]) continue;
-      seen[src.link] = 1;
-      results.push({
-        title: src.title || src.link,
+        title,
+        domain,
         link: src.link,
-        snippet: ""
+        snippet: hit && String(hit.snippet || "").trim() || "",
+        verified: true
       });
+    });
+    // 2) 対応する参照結果が無いモデル出力は、リンクが保証できないため結果にしない。
+    //    ただし要約だけは、同じドメインの既存結果に補完する。
+    items.forEach(it => {
+      if (!it || !it.snippet) return;
+      const r = results.find(x => !x.snippet && domainsMatch(x.domain, it.domain || ""));
+      if (r) r.snippet = String(it.snippet).trim();
+    });
+  };
+  absorb(await runAndCollect(baseInstruction));
+
+  // 件数が少ないときは観点を変えてもう一度検索し、結果を増やす
+  if (results.length < 6) {
+    try {
+      absorb(await runAndCollect(extraInstruction));
+    } catch (e) {
+      if (e.message === "NETWORK_BLOCKED") throw e;
     }
-    if (results.length > 0) return results;
-    lastErr = new Error("Gemini検索: 結果の解析に失敗しました。もう一度お試しください。");
   }
-  throw lastErr || new Error("Gemini検索: 呼び出しに失敗しました");
+  if (results.length > 0) return results;
+
+  // 参照情報がまったく得られなかった場合のみ、Google検索の結果ページを案内する
+  if (!lastErr) {
+    return [{
+      title: "Googleで「" + query + "」の検索結果を開く",
+      domain: "google.com",
+      link: googleSearchUrl(query),
+      snippet: "今回は参照元の情報を取得できませんでした。Google検索の結果ページから直接ご確認ください。",
+      verified: false
+    }];
+  }
+  throw lastErr;
 }
 
 // --- 生成AI: Gemini API(無料枠) ---
@@ -876,6 +949,27 @@ const INTERNAL_NAV = {
 function markInternalNavigation() {
   INTERNAL_NAV.at = Date.now();
 }
+
+// URLから表示用のサイト名(ホスト名)を作る。タイトルが取得できない場合の表示に用いる。
+function hostLabel(u) {
+  try {
+    const h = new URL(u).hostname.replace(/^www\./, "");
+    // Geminiのグラウンディングはリダイレクト用URLを返すことがあり、その場合ホスト名は参考にならない
+    if (/vertexaisearch|googleusercontent|grounding-api/.test(h)) return "";
+    return h;
+  } catch (e) {
+    return "";
+  }
+}
+// 表示名の決定: ページタイトル → グラウンディングのタイトル → サイト名(ホスト名)の順。
+// URLそのものをタイトルとして表示することは避ける。
+function displayTitle(title, link) {
+  const t = (title || "").trim();
+  if (t && !/^https?:\/\//.test(t)) return t;
+  const h = hostLabel(link);
+  if (h) return h;
+  return t || "(タイトル不明)";
+}
 function isValidUrl(u) {
   return typeof u === "string" && /^https?:\/\/.+/.test(u);
 }
@@ -923,20 +1017,23 @@ function SearchResultCard({
     rel: "noopener noreferrer",
     onClick: markInternalNavigation,
     className: "text-sm font-medium text-sky-700 hover:underline break-all"
-  }, item.title || "(タイトルなし)"), /*#__PURE__*/React.createElement("p", {
+  }, item.title || item.domain || "検索結果"), /*#__PURE__*/React.createElement("p", {
     className: "text-xs text-stone-400 break-all"
-  }, valid ? item.link : "(URL不明のためGoogle検索リンクを使用)"), /*#__PURE__*/React.createElement("p", {
+  }, item.domain || hostLabel(item.link) || "Google検索の参照先"), item.snippet ? /*#__PURE__*/React.createElement("p", {
     className: "text-xs text-stone-600 mt-1"
-  }, item.snippet), /*#__PURE__*/React.createElement("div", {
+  }, item.snippet) : /*#__PURE__*/React.createElement("p", {
+    className: "text-xs text-stone-400 mt-1"
+  }, "(要約を取得できませんでした。リンク先でご確認ください)"), /*#__PURE__*/React.createElement("div", {
     className: "flex gap-2 mt-2 flex-wrap"
   }, /*#__PURE__*/React.createElement("button", {
     onClick: () => onQuote(item.snippet),
-    className: "text-xs text-amber-700 border border-amber-300 rounded px-2 py-1 hover:bg-amber-50"
-  }, "スニペットを本文に引用(コピペとして記録)"), /*#__PURE__*/React.createElement("button", {
+    disabled: !item.snippet,
+    className: "text-xs text-amber-700 border border-amber-300 rounded px-2 py-1 hover:bg-amber-50 disabled:opacity-40"
+  }, "要約を本文に引用(コピペとして記録)"), /*#__PURE__*/React.createElement("button", {
     onClick: copyLink,
     className: "text-xs text-stone-600 border border-stone-300 rounded px-2 py-1 hover:bg-stone-50"
   }, copied ? "コピーしました✓" : "リンクをコピー"), /*#__PURE__*/React.createElement("a", {
-    href: googleSearchUrl(item.title),
+    href: googleSearchUrl(((item.title || "") + " " + (item.domain || "")).trim()),
     target: "_blank",
     rel: "noopener noreferrer",
     onClick: markInternalNavigation,
@@ -978,6 +1075,9 @@ function StudentEditor({
   const taRef = useRef(null);
   const pasteInfoRef = useRef(null);
   const aiOutputsRef = useRef([]); // このセッションでAIが出力した回答(部分コピペ検出用)
+  const pendingRef = useRef(null); // 離脱確定待ちのタイマー
+  const searchingRef = useRef(false); // 検索の二重発火防止
+  const aiLoadingRef = useRef(false); // AI依頼の二重発火防止
   const hiddenRef = useRef(null); // 画面離脱(別タブ/他アプリ)の開始時刻
 
   // 貼り付けられたテキストがAIの回答(の一部)かを判定
@@ -1026,18 +1126,42 @@ function StudentEditor({
   // 本システムのタブが非表示になった/ウィンドウがフォーカスを失った時刻を記録し、
   // 復帰時に離脱時間(別タブ・他アプリの利用時間)としてイベントログに残す。
   useEffect(() => {
-    // システム内の検索結果リンク等からの遷移は、学習活動の一部として離脱に数えない。
-    // リンククリック直後(2秒以内)に発生した非表示は無視する。
+    // 離脱として記録するのは「本システムの画面を実際に離れた場合」のみとする。
+    // 次の3つは離脱に数えない:
+    //  (1) システム内の操作(タブ切替・API設定・追体験画面への移動など)
+    //  (2) システム内の検索結果リンクから外部サイトを開いた場合
+    //  (3) 仮想キーボードの開閉や要素の表示切替に伴う一瞬のフォーカス喪失
+    // (3)への対処として、非表示を検知しても即座には記録せず、CONFIRM_MS 経過後も
+    // 実際に非表示/非フォーカスのままである場合に限って離脱として確定する。
+    const CONFIRM_MS = 1500;
+    const isAway = () => {
+      if (document.hidden) return true;
+      try {
+        if (typeof document.hasFocus === "function" && !document.hasFocus()) return true;
+      } catch (e) {}
+      return false;
+    };
     const onHide = () => {
-      if (Date.now() - INTERNAL_NAV.at < 2000) return;
-      if (startRef.current && hiddenRef.current == null) {
-        hiddenRef.current = Date.now();
+      if (Date.now() - INTERNAL_NAV.at < 2500) return; // システム内の操作が起点なら無視
+      if (!startRef.current || hiddenRef.current != null || pendingRef.current != null) return;
+      const startedAt = Date.now();
+      pendingRef.current = setTimeout(() => {
+        pendingRef.current = null;
+        if (!isAway()) return; // 復帰済み = 見かけ上のblurだった
+        if (Date.now() - INTERNAL_NAV.at < 2500) return;
+        hiddenRef.current = startedAt;
         pushEvent({
           type: "blur"
         });
-      }
+      }, CONFIRM_MS);
     };
     const onShow = () => {
+      if (pendingRef.current != null) {
+        // 確定前に復帰 = 離脱として記録しない
+        clearTimeout(pendingRef.current);
+        pendingRef.current = null;
+        return;
+      }
       if (hiddenRef.current != null) {
         const away = Date.now() - hiddenRef.current;
         hiddenRef.current = null;
@@ -1057,6 +1181,10 @@ function StudentEditor({
       document.removeEventListener("visibilitychange", onVis);
       window.removeEventListener("blur", onHide);
       window.removeEventListener("focus", onShow);
+      if (pendingRef.current != null) {
+        clearTimeout(pendingRef.current);
+        pendingRef.current = null;
+      }
     };
   }, [pushEvent]);
 
@@ -1189,7 +1317,10 @@ function StudentEditor({
     };
   };
   const runSearch = async () => {
-    if (!query.trim() || searching) return;
+    // 状態更新は非同期のため、モバイルでの二重発火(タッチ+クリック等)を
+    // refで確実に遮断する。これにより1回の検索が複数回記録されることを防ぐ。
+    if (!query.trim() || searching || searchingRef.current) return;
+    searchingRef.current = true;
     setSearching(true);
     setSearchErr("");
     setSearchItems(null);
@@ -1215,10 +1346,12 @@ function StudentEditor({
         setSearchErr("検索エラー: " + err.message);
       }
     }
+    searchingRef.current = false;
     setSearching(false);
   };
   const runAI = async () => {
-    if (!aiPrompt.trim() || aiLoading) return;
+    if (!aiPrompt.trim() || aiLoading || aiLoadingRef.current) return;
+    aiLoadingRef.current = true;
     setAiLoading(true);
     setAiErr("");
     setAiResult("");
@@ -1245,6 +1378,7 @@ function StudentEditor({
         setAiErr("AIエラー: " + err.message);
       }
     }
+    aiLoadingRef.current = false;
     setAiLoading(false);
   };
   const insertAI = () => {
@@ -2204,6 +2338,7 @@ function SharedProcesses({
   const viewRef = useRef(null); // 閲覧セッション(層1): 開始時刻と到達区間
 
   const beginView = s2 => {
+    markInternalNavigation();
     viewRef.current = {
       sub: s2,
       start: Date.now(),
@@ -2213,6 +2348,7 @@ function SharedProcesses({
     setSelected(s2);
   };
   const endView = () => {
+    markInternalNavigation();
     const v = viewRef.current;
     viewRef.current = null;
     if (!v) return;
@@ -2440,8 +2576,33 @@ function App() {
   const [role, setRole] = useState(FIXED_ROLE || "student");
   const [studentTab, setStudentTab] = useState("write");
   const [teacherTab, setTeacherTab] = useState("list");
-  const [studentName, setStudentName] = useState("");
+  // 氏名はタブ単位(sessionStorage)で保持する。
+  //  ・ページ再読み込み(モバイルの引っ張り更新を含む)では保持される
+  //  ・タブを閉じると破棄されるため、次にリンクを開いた人は氏名入力から始まる
+  // 端末に残り続けて別の学生が同じ氏名のまま使ってしまうことを防ぐ。
+  const [studentName, setStudentName] = useState(() => {
+    try {
+      return sessionStorage.getItem("rpp:studentName") || "";
+    } catch (e) {
+      return "";
+    }
+  });
   const [tempName, setTempName] = useState("");
+  // 旧版が端末へ恒久保存していた氏名が残っていれば破棄する
+  useEffect(() => {
+    try {
+      localStorage.removeItem("rpp:studentName");
+    } catch (e) {}
+  }, []);
+  const commitName = n => {
+    const v = (n || "").trim();
+    if (!v) return;
+    try {
+      sessionStorage.setItem("rpp:studentName", v);
+    } catch (e) {}
+    setStudentName(v);
+    setEditorKey(k => k + 1);
+  };
   const [seeding, setSeeding] = useState(false);
   const [editorKey, setEditorKey] = useState(0);
   const [refreshSignal, setRefreshSignal] = useState(0);
@@ -2453,6 +2614,8 @@ function App() {
   });
   const [showSettings, setShowSettings] = useState(false);
   const [notice, setNotice] = useState("");
+  // 共有DBの接続状態(配布時の埋め込み、または利用者がAPI設定で入力したURL)
+  const syncConfigured = !!(typeof window !== "undefined" && window.__SYNC_URL__ || settings.syncUrl || syncEnabled());
   useEffect(() => {
     (async () => {
       // 配布時に埋め込まれた共有DB URLを最優先で適用
@@ -2508,20 +2671,42 @@ function App() {
   }, "教員用"))), /*#__PURE__*/React.createElement("div", {
     className: "ml-auto flex items-center gap-2 flex-wrap"
   }, /*#__PURE__*/React.createElement("button", {
-    onClick: () => setShowSettings(true),
+    onClick: () => {
+      markInternalNavigation();
+      setShowSettings(true);
+    },
     className: "px-3 py-1.5 text-sm border border-stone-200 rounded-lg text-stone-600 hover:bg-stone-50 flex items-center gap-2"
   }, "⚙ API設定", /*#__PURE__*/React.createElement("span", {
     className: "w-2 h-2 rounded-full " + (settings.geminiKey ? "bg-violet-500" : "bg-stone-300"),
     title: "Gemini"
   }), /*#__PURE__*/React.createElement("span", {
-    className: "w-2 h-2 rounded-full " + (syncEnabled() ? "bg-emerald-500" : "bg-stone-300"),
+    className: "w-2 h-2 rounded-full " + (syncConfigured ? "bg-emerald-500" : "bg-stone-300"),
     title: "共有DB"
-  })), role === "student" && /*#__PURE__*/React.createElement("input", {
+  })), role === "student" && /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center gap-1"
+  }, /*#__PURE__*/React.createElement("input", {
     value: studentName,
-    onChange: e => setStudentName(e.target.value),
+    onChange: e => {
+      setStudentName(e.target.value);
+      try {
+        sessionStorage.setItem("rpp:studentName", e.target.value);
+      } catch (er) {}
+    },
     className: "border border-stone-200 rounded-lg px-3 py-1.5 text-sm w-28 outline-none",
     placeholder: "氏名"
-  }), !FIXED_ROLE && /*#__PURE__*/React.createElement("div", {
+  }), /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      markInternalNavigation();
+      try {
+        sessionStorage.removeItem("rpp:studentName");
+      } catch (er) {}
+      setTempName("");
+      setStudentName("");
+      setEditorKey(k => k + 1);
+    },
+    title: "別の人が使う場合に氏名をリセットします",
+    className: "px-2 py-1.5 text-xs border border-stone-200 rounded-lg text-stone-500 hover:bg-stone-50"
+  }, "交代")), !FIXED_ROLE && /*#__PURE__*/React.createElement("div", {
     className: "flex bg-stone-100 rounded-lg p-1 items-center"
   }, /*#__PURE__*/React.createElement("span", {
     className: "text-xs text-stone-400 px-2"
@@ -2544,13 +2729,22 @@ function App() {
   }, "×")), role === "student" ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     className: "flex gap-2 flex-wrap items-center"
   }, /*#__PURE__*/React.createElement("button", {
-    onClick: () => setStudentTab("write"),
+    onClick: () => {
+      markInternalNavigation();
+      setStudentTab("write");
+    },
     className: "px-4 py-2 text-sm rounded-lg " + (studentTab === "write" ? "bg-stone-900 text-white" : "bg-white border border-stone-200 text-stone-500")
   }, "レポート作成"), /*#__PURE__*/React.createElement("button", {
-    onClick: () => setStudentTab("shared"),
+    onClick: () => {
+      markInternalNavigation();
+      setStudentTab("shared");
+    },
     className: "px-4 py-2 text-sm rounded-lg " + (studentTab === "shared" ? "bg-stone-900 text-white" : "bg-white border border-stone-200 text-stone-500")
   }, "共有された生成過程"), /*#__PURE__*/React.createElement("button", {
-    onClick: () => setStudentTab("chain"),
+    onClick: () => {
+      markInternalNavigation();
+      setStudentTab("chain");
+    },
     className: "px-4 py-2 text-sm rounded-lg " + (studentTab === "chain" ? "bg-stone-900 text-white" : "bg-white border border-stone-200 text-stone-500")
   }, "ブロックチェーン"), /*#__PURE__*/React.createElement("span", {
     className: "ml-auto text-xs text-stone-400 font-mono"
@@ -2571,10 +2765,16 @@ function App() {
   })) : /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement("div", {
     className: "flex gap-2"
   }, /*#__PURE__*/React.createElement("button", {
-    onClick: () => setTeacherTab("list"),
+    onClick: () => {
+      markInternalNavigation();
+      setTeacherTab("list");
+    },
     className: "px-4 py-2 text-sm rounded-lg " + (teacherTab === "list" ? "bg-stone-900 text-white" : "bg-white border border-stone-200 text-stone-500")
   }, "提出物一覧"), /*#__PURE__*/React.createElement("button", {
-    onClick: () => setTeacherTab("chain"),
+    onClick: () => {
+      markInternalNavigation();
+      setTeacherTab("chain");
+    },
     className: "px-4 py-2 text-sm rounded-lg " + (teacherTab === "chain" ? "bg-stone-900 text-white" : "bg-white border border-stone-200 text-stone-500")
   }, "ブロックチェーン")), teacherTab === "list" ? /*#__PURE__*/React.createElement(React.Fragment, null, /*#__PURE__*/React.createElement(TeacherView, {
     refreshSignal: refreshSignal
@@ -2599,27 +2799,22 @@ function App() {
     value: tempName,
     onChange: e => setTempName(e.target.value),
     onKeyDown: e => {
-      if (e.key === "Enter" && tempName.trim()) {
-        setStudentName(tempName.trim());
-        setEditorKey(k => k + 1);
-      }
+      if (e.key === "Enter") commitName(tempName);
     },
     placeholder: "例: 山田 太郎",
     autoFocus: true,
     className: "border border-stone-300 rounded-lg px-3 py-2 text-sm outline-none focus:border-stone-500"
   }), /*#__PURE__*/React.createElement("button", {
-    onClick: () => {
-      if (tempName.trim()) {
-        setStudentName(tempName.trim());
-        setEditorKey(k => k + 1);
-      }
-    },
+    onClick: () => commitName(tempName),
     disabled: !tempName.trim(),
     className: "px-5 py-2 bg-stone-900 text-white text-sm rounded-lg hover:bg-stone-700 disabled:opacity-40"
   }, "この名前で開始"))), showSettings && /*#__PURE__*/React.createElement(SettingsPanel, {
     settings: settings,
     onSave: saveSettings,
-    onClose: () => setShowSettings(false)
+    onClose: () => {
+      markInternalNavigation();
+      setShowSettings(false);
+    }
   }));
 }
 ReactDOM.createRoot(document.getElementById("root")).render(React.createElement(App));
