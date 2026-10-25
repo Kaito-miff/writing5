@@ -381,17 +381,23 @@ async function submissionContentHash(sub) {
 function normDomain(d) {
   return String(d || "").trim().toLowerCase().replace(/^https?:\/\//, "").replace(/^www\./, "").split("/")[0].split("?")[0];
 }
-function domainsMatch(a, b) {
-  const x = normDomain(a),
-    y = normDomain(b);
-  if (!x || !y) return false;
-  return x === y || x.endsWith("." + y) || y.endsWith("." + x);
-}
 
-// Gemini検索を1回実行し、「実際に参照された検索結果(リンク)」と
-// 「モデルが付けた見出し・要約」の両方を取得する。
-async function geminiSearchOnce(query, settings, model, instruction) {
+// Gemini APIを1回呼び出す共通処理
+async function geminiCall(settings, model, instruction, useSearch) {
   const url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + encodeURIComponent(settings.geminiKey);
+  const body = {
+    contents: [{
+      parts: [{
+        text: instruction
+      }]
+    }],
+    generationConfig: {
+      maxOutputTokens: 8192
+    }
+  };
+  if (useSearch) body.tools = [{
+    google_search: {}
+  }];
   let res;
   try {
     res = await fetch(url, {
@@ -399,19 +405,7 @@ async function geminiSearchOnce(query, settings, model, instruction) {
       headers: {
         "Content-Type": "application/json"
       },
-      body: JSON.stringify({
-        contents: [{
-          parts: [{
-            text: instruction
-          }]
-        }],
-        tools: [{
-          google_search: {}
-        }],
-        generationConfig: {
-          maxOutputTokens: 8192
-        }
-      })
+      body: JSON.stringify(body)
     });
   } catch (e) {
     throw new Error("NETWORK_BLOCKED");
@@ -421,122 +415,171 @@ async function geminiSearchOnce(query, settings, model, instruction) {
     data = await res.json();
   } catch (e) {}
   if (data.error) {
-    const err = new Error("Gemini検索: " + (data.error.message || res.status));
+    const err = new Error("Gemini: " + (data.error.message || res.status));
     err.code = data.error.code || res.status;
     throw err;
   }
-  const cand = data.candidates && data.candidates[0];
-  const parts = cand && cand.content && cand.content.parts;
-  const text = (parts || []).map(p => p.text || "").join("");
-
-  // モデルが返した見出し・要約(domain をキーにして後でリンクと対応づける)
-  let items = [];
-  const m = text.replace(/```json|```/g, "").match(/\[[\s\S]*\]/);
-  if (m) {
-    try {
-      items = JSON.parse(m[0]) || [];
-    } catch (e) {}
-  }
-  if (!Array.isArray(items)) items = [];
-
-  // 実際に参照された検索結果。web.title にはドメイン名が入る。
-  const chunks = cand && cand.groundingMetadata && cand.groundingMetadata.groundingChunks || [];
-  const sources = chunks.filter(c => c && c.web && c.web.uri).map(c => ({
-    domain: normDomain(c.web.title || ""),
-    link: c.web.uri
-  }));
-  return {
-    items,
-    sources
-  };
+  return data.candidates && data.candidates[0];
 }
 
-// 検索結果の組み立て:
-//  ・リンクは必ずグラウンディング情報(実際に参照された検索結果)から取る → 404や無関係サイトを防ぐ
-//  ・見出しと要約はモデル出力から取り、ドメイン名で両者を突き合わせる
-//  ・結果が少ない場合は観点を変えてもう一度検索し、重複を除いて統合する
+// 【段階1】検索を実行し、参照された情報源と「その情報源に裏付けられた文」を取り出す。
+// groundingSupports は API が生成する対応データであり、モデルの自己申告ではないため、
+// 要約文と情報源の対応が崩れない。
+async function searchSources(query, settings, model, instruction) {
+  const cand = await geminiCall(settings, model, instruction, true);
+  const gm = cand && cand.groundingMetadata || {};
+  const chunks = gm.groundingChunks || [];
+  const supports = gm.groundingSupports || [];
+  const list = chunks.map(c => ({
+    domain: c && c.web ? normDomain(c.web.title || c.web.uri) : "",
+    link: c && c.web ? c.web.uri : "",
+    snippet: ""
+  }));
+
+  // 各文を、その文を裏付けた情報源へ割り当てる
+  supports.forEach(sp => {
+    const t = (sp && sp.segment && sp.segment.text || "").trim();
+    if (!t) return;
+    (sp.groundingChunkIndices || []).forEach(ci => {
+      const item = list[ci];
+      if (!item || item.snippet.length > 260) return;
+      item.snippet += (item.snippet ? " " : "") + t;
+    });
+  });
+  return list.filter(x => x.link);
+}
+
+// 【段階2】取得済みのドメイン一覧を渡し、日本語での名称と関連性を判定させる。
+// 検索は使わず、与えた一覧に対して答えるだけなので、存在しないサイトが混ざらない。
+async function nameAndFilterSources(query, domains, settings, model) {
+  if (domains.length === 0) return {};
+  const instruction = "次のウェブサイト一覧について、それぞれの日本語での名称と、「" + query + "」という調べものの情報源として適切かどうかを判定してください。\n" + "一覧: " + domains.join(", ") + "\n\n" + 'JSON配列のみで返してください。形式: [{"domain": "weblio.jp", "name": "Weblio辞書", "relevant": true}]\n' + "・name は「weblio.jp」のようなドメイン名ではなく、「Weblio辞書」「朝日新聞デジタル」のような読んで分かる日本語の名称にすること。\n" + "・名称が分からない場合は、そのドメインから推測できる最も自然な名称を書くこと。\n" + "・relevant は、調べものの内容と無関係なサイト、広告目的のサイト、日本語でも英語でもない言語で書かれたサイトの場合に false とすること。\n" + "・一覧にあるドメインすべてについて、漏れなく回答すること。\n" + "・JSON以外の文字、前置き、コードブロック記号は一切出力しないこと。";
+  let cand = null;
+  try {
+    cand = await geminiCall(settings, model, instruction, false);
+  } catch (e) {
+    return {};
+  }
+  const parts = cand && cand.content && cand.content.parts;
+  const text = (parts || []).map(p => p.text || "").join("");
+  const m = text.replace(/```json|```/g, "").match(/\[[\s\S]*\]/);
+  if (!m) return {};
+  let arr = [];
+  try {
+    arr = JSON.parse(m[0]) || [];
+  } catch (e) {
+    return {};
+  }
+  const map = {};
+  (Array.isArray(arr) ? arr : []).forEach(it => {
+    if (!it || !it.domain) return;
+    map[normDomain(it.domain)] = {
+      name: String(it.name || "").trim(),
+      relevant: it.relevant !== false
+    };
+  });
+  return map;
+}
+
+// 検索結果の組み立て
+//  ・リンクと要約は、APIが提供する参照データのみから作る(モデルの創作URLを排除)
+//  ・サイト名は、取得済みドメイン一覧に対する命名で全件そろえる(表示の不統一を解消)
+//  ・無関係なサイトは関連性判定で除外する
 async function callGeminiSearch(query, settings) {
   if (!settings.geminiKey) throw new Error("NO_KEY");
-  const baseInstruction = "「" + query + "」についてGoogle検索を行い、参照した情報源ごとの情報をJSON配列のみで返してください。\n" + '各要素の形式: {"domain": "情報源のドメイン名(例: weblio.jp)", "title": "ページまたはサイトの名称(日本語)", "snippet": "その情報源に書かれている内容の要約(日本語で2〜3文)"}\n' + "・domain には実際に参照したサイトのドメイン名のみを記載すること(URL全体やパスは不要)。\n" + "・title には「weblio.jp」のようなドメイン名ではなく、「Weblio辞書」のような読んで分かる名称を書くこと。\n" + "・snippet は必ず記入し、そのページの内容を具体的に要約すること。\n" + "・できるだけ多く(可能なら10件以上)、多様な情報源を挙げること。日本語の情報源を優先すること。\n" + "・URLは推測して書かないこと。JSON以外の文字、前置き、コードブロック記号は一切出力しないこと。";
-  const extraInstruction = "「" + query + "」について、別の観点(定義・具体例・解説記事・ニュース・統計など)からもGoogle検索を行い、" + "先ほどとは異なる情報源を中心にJSON配列のみで返してください。\n" + '各要素の形式: {"domain": "ドメイン名", "title": "読んで分かる名称(日本語)", "snippet": "内容の要約(日本語で2〜3文)"}\n' + "・title にドメイン名をそのまま書かないこと。snippet は必ず記入すること。\n" + "・JSON以外の文字は一切出力しないこと。";
+  const mainInstruction = "「" + query + "」についてGoogle検索を行い、分かったことを日本語で詳しく説明してください。\n" + "・できるだけ多くの情報源(可能なら10件以上)を参照し、それぞれの情報源の内容に触れること。\n" + "・定義、具体例、解説、関連する話題など、複数の観点から説明すること。\n" + "・日本語の情報源を優先して参照すること。\n" + "・箇条書きで、1項目につき2〜3文で書くこと。";
+  const extraInstruction = "「" + query + "」について、先ほどとは別の観点(具体例、事例、統計、関連制度、実務上の扱いなど)から" + "さらにGoogle検索を行い、新しい情報源の内容を日本語で詳しく説明してください。箇条書きで、1項目につき2〜3文で書くこと。";
   const models = Array.from(new Set([settings.geminiModel || "gemini-2.5-flash", "gemini-2.5-flash", "gemini-2.0-flash"]));
-  const results = [];
-  const seenLink = {};
-  const MAX_RESULTS = 20;
-  let lastErr = null;
   let usedModel = null;
-
-  // モデル候補を順に試し、最初に成功したものを使う
-  const runAndCollect = async instruction => {
+  let lastErr = null;
+  const runSearch = async instruction => {
     const tryModels = usedModel ? [usedModel] : models;
     for (const mdl of tryModels) {
       try {
-        const out = await geminiSearchOnce(query, settings, mdl, instruction);
+        const out = await searchSources(query, settings, mdl, instruction);
         usedModel = mdl;
         return out;
       } catch (e) {
         if (e.message === "NETWORK_BLOCKED") throw e;
         lastErr = e;
-        if (e.code === 404) continue; // モデル名が無い場合のみ次を試す
+        if (e.code === 404) continue;
         throw e;
       }
     }
-    return null;
+    return [];
   };
-  const absorb = out => {
-    if (!out) return;
-    const {
-      items,
-      sources
-    } = out;
-    // 1) 参照された検索結果それぞれに、ドメインが一致するモデル出力を対応づける
-    sources.forEach(src => {
-      if (!src.link || seenLink[src.link] || results.length >= MAX_RESULTS) return;
-      const hit = items.find(it => it && domainsMatch(it.domain || "", src.domain)) || items.find(it => it && domainsMatch(it.domain || "", src.domain || "") && it.title);
-      seenLink[src.link] = 1;
-      const domain = src.domain || normDomain(hit && hit.domain) || "";
-      let title = hit && String(hit.title || "").trim() || "";
-      // 見出しがドメイン名そのものだった場合は、せめて先頭を大文字化して区別できるようにする
-      if (!title || normDomain(title) === domain) title = domain || "検索結果";
-      results.push({
-        title,
-        domain,
-        link: src.link,
-        snippet: hit && String(hit.snippet || "").trim() || "",
-        verified: true
-      });
-    });
-    // 2) 対応する参照結果が無いモデル出力は、リンクが保証できないため結果にしない。
-    //    ただし要約だけは、同じドメインの既存結果に補完する。
-    items.forEach(it => {
-      if (!it || !it.snippet) return;
-      const r = results.find(x => !x.snippet && domainsMatch(x.domain, it.domain || ""));
-      if (r) r.snippet = String(it.snippet).trim();
-    });
-  };
-  absorb(await runAndCollect(baseInstruction));
 
-  // 件数が少ないときは観点を変えてもう一度検索し、結果を増やす
-  if (results.length < 6) {
+  // 段階1: 検索(件数が少なければ観点を変えてもう一度)
+  let collected = await runSearch(mainInstruction);
+  if (collected.length < 6) {
     try {
-      absorb(await runAndCollect(extraInstruction));
+      const more = await runSearch(extraInstruction);
+      collected = collected.concat(more);
     } catch (e) {
       if (e.message === "NETWORK_BLOCKED") throw e;
     }
   }
-  if (results.length > 0) return results;
 
-  // 参照情報がまったく得られなかった場合のみ、Google検索の結果ページを案内する
-  if (!lastErr) {
-    return [{
-      title: "Googleで「" + query + "」の検索結果を開く",
-      domain: "google.com",
-      link: googleSearchUrl(query),
-      snippet: "今回は参照元の情報を取得できませんでした。Google検索の結果ページから直接ご確認ください。",
-      verified: false
-    }];
+  // リンクの重複を除去し、同一ドメインは要約が充実している方を残す
+  const byLink = {};
+  collected.forEach(it => {
+    if (!it.link) return;
+    const cur = byLink[it.link];
+    if (!cur || (it.snippet || "").length > (cur.snippet || "").length) byLink[it.link] = it;
+  });
+  let results = Object.keys(byLink).map(k => byLink[k]);
+  const byDomain = {};
+  results.forEach(it => {
+    const d = it.domain || it.link;
+    const cur = byDomain[d];
+    if (!cur || (it.snippet || "").length > (cur.snippet || "").length) byDomain[d] = it;
+  });
+  results = Object.keys(byDomain).map(k => byDomain[k]).slice(0, 20);
+
+  // 段階2: 全件のサイト名をそろえ、無関係なものを除外する
+  if (results.length > 0 && usedModel) {
+    const domains = Array.from(new Set(results.map(r => r.domain).filter(Boolean)));
+    const info = await nameAndFilterSources(query, domains, settings, usedModel);
+    // 命名が一部欠けると表示が不揃いになるため、欠けた分だけ再取得する
+    const missing = domains.filter(d => !info[d] || !info[d].name);
+    if (missing.length > 0) {
+      const retry = await nameAndFilterSources(query, missing, settings, usedModel);
+      Object.keys(retry).forEach(d => {
+        if (!info[d] || !info[d].name) info[d] = retry[d];
+      });
+    }
+    results = results.filter(r => {
+      const inf = info[r.domain];
+      return !inf || inf.relevant !== false; // 判定が得られない場合は残す
+    }).map(r => {
+      const inf = info[r.domain] || {};
+      const name = inf.name && normDomain(inf.name) !== r.domain ? inf.name : "";
+      return {
+        title: name || r.domain || "検索結果",
+        domain: r.domain,
+        link: r.link,
+        snippet: r.snippet,
+        verified: true
+      };
+    });
+  } else {
+    results = results.map(r => ({
+      title: r.domain || "検索結果",
+      domain: r.domain,
+      link: r.link,
+      snippet: r.snippet,
+      verified: true
+    }));
   }
-  throw lastErr;
+  if (results.length > 0) return results;
+  if (lastErr) throw lastErr;
+  return [{
+    title: "Googleで「" + query + "」の検索結果を開く",
+    domain: "google.com",
+    link: googleSearchUrl(query),
+    snippet: "今回は参照元の情報を取得できませんでした。Google検索の結果ページから直接ご確認ください。",
+    verified: false
+  }];
 }
 
 // --- 生成AI: Gemini API(無料枠) ---
