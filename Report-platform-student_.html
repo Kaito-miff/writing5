@@ -383,51 +383,99 @@ function normDomain(d) {
 }
 
 // Gemini APIを1回呼び出す共通処理
-async function geminiCall(settings, model, instruction, useSearch) {
+// opts: { useSearch, system, history, maxTokens, temperature, thinking }
+// thinking を有効にすると、モデルが内部で推論してから回答するため回答精度が上がる。
+// 対応していないモデルでは400が返るため、その場合は自動的に外して再送する。
+async function geminiCall(settings, model, instruction, opts) {
+  const o = opts || {};
   const url = "https://generativelanguage.googleapis.com/v1beta/models/" + model + ":generateContent?key=" + encodeURIComponent(settings.geminiKey);
-  const body = {
-    contents: [{
+  const buildBody = withThinking => {
+    const contents = [];
+    (o.history || []).forEach(h => {
+      if (!h || !h.text) return;
+      contents.push({
+        role: h.role === "model" ? "model" : "user",
+        parts: [{
+          text: h.text
+        }]
+      });
+    });
+    contents.push({
+      role: "user",
       parts: [{
         text: instruction
       }]
-    }],
-    generationConfig: {
-      maxOutputTokens: 8192
-    }
-  };
-  if (useSearch) body.tools = [{
-    google_search: {}
-  }];
-  let res;
-  try {
-    res = await fetch(url, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
-      },
-      body: JSON.stringify(body)
     });
-  } catch (e) {
-    throw new Error("NETWORK_BLOCKED");
+    const gen = {
+      maxOutputTokens: o.maxTokens || 8192,
+      temperature: o.temperature != null ? o.temperature : 0.7
+    };
+    if (withThinking) gen.thinkingConfig = {
+      thinkingBudget: o.thinking || -1
+    };
+    const body = {
+      contents: contents,
+      generationConfig: gen
+    };
+    if (o.useSearch) body.tools = [{
+      google_search: {}
+    }];
+    if (o.system) body.systemInstruction = {
+      parts: [{
+        text: o.system
+      }]
+    };
+    return body;
+  };
+  const send = async withThinking => {
+    let res;
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(buildBody(withThinking))
+      });
+    } catch (e) {
+      throw new Error("NETWORK_BLOCKED");
+    }
+    let data = {};
+    try {
+      data = await res.json();
+    } catch (e) {}
+    return {
+      data: data,
+      status: res.status
+    };
+  };
+  let r = await send(o.thinking !== 0);
+  // 思考設定に非対応なモデルでは400が返るため、外して再試行する
+  if (r.data.error && (r.data.error.code === 400 || r.status === 400) && o.thinking !== 0) {
+    r = await send(false);
   }
-  let data = {};
-  try {
-    data = await res.json();
-  } catch (e) {}
-  if (data.error) {
-    const err = new Error("Gemini: " + (data.error.message || res.status));
-    err.code = data.error.code || res.status;
+  if (r.data.error) {
+    const err = new Error("Gemini: " + (r.data.error.message || r.status));
+    err.code = r.data.error.code || r.status;
     throw err;
   }
-  return data.candidates && data.candidates[0];
+  return r.data.candidates && r.data.candidates[0];
 }
 
 // 【段階1】検索を実行し、参照された情報源と「その情報源に裏付けられた文」を取り出す。
 // groundingSupports は API が生成する対応データであり、モデルの自己申告ではないため、
 // 要約文と情報源の対応が崩れない。
 async function searchSources(query, settings, model, instruction) {
-  const cand = await geminiCall(settings, model, instruction, true);
+  const cand = await geminiCall(settings, model, instruction, {
+    useSearch: true,
+    maxTokens: 8192,
+    temperature: 0.4,
+    // 検索結果の要約は事実重視のため低め
+    thinking: -1
+  });
   const gm = cand && cand.groundingMetadata || {};
+  const cparts = cand && cand.content && cand.content.parts || [];
+  const overview = cparts.map(x => x.text || "").join("").trim();
   const chunks = gm.groundingChunks || [];
   const supports = gm.groundingSupports || [];
   const list = chunks.map(c => ({
@@ -446,7 +494,10 @@ async function searchSources(query, settings, model, instruction) {
       item.snippet += (item.snippet ? " " : "") + t;
     });
   });
-  return list.filter(x => x.link);
+  return {
+    sources: list.filter(x => x.link),
+    overview: overview
+  };
 }
 
 // 【段階2】取得済みのドメイン一覧を渡し、日本語での名称と関連性を判定させる。
@@ -456,7 +507,11 @@ async function nameAndFilterSources(query, domains, settings, model) {
   const instruction = "次のウェブサイト一覧について、それぞれの日本語での名称と、「" + query + "」という調べものの情報源として適切かどうかを判定してください。\n" + "一覧: " + domains.join(", ") + "\n\n" + 'JSON配列のみで返してください。形式: [{"domain": "weblio.jp", "name": "Weblio辞書", "relevant": true}]\n' + "・name は「weblio.jp」のようなドメイン名ではなく、「Weblio辞書」「朝日新聞デジタル」のような読んで分かる日本語の名称にすること。\n" + "・名称が分からない場合は、そのドメインから推測できる最も自然な名称を書くこと。\n" + "・relevant は、調べものの内容と無関係なサイト、広告目的のサイト、日本語でも英語でもない言語で書かれたサイトの場合に false とすること。\n" + "・一覧にあるドメインすべてについて、漏れなく回答すること。\n" + "・JSON以外の文字、前置き、コードブロック記号は一切出力しないこと。";
   let cand = null;
   try {
-    cand = await geminiCall(settings, model, instruction, false);
+    cand = await geminiCall(settings, model, instruction, {
+      maxTokens: 4096,
+      temperature: 0.2,
+      thinking: 0
+    });
   } catch (e) {
     return {};
   }
@@ -487,8 +542,8 @@ async function nameAndFilterSources(query, domains, settings, model) {
 //  ・無関係なサイトは関連性判定で除外する
 async function callGeminiSearch(query, settings) {
   if (!settings.geminiKey) throw new Error("NO_KEY");
-  const mainInstruction = "「" + query + "」についてGoogle検索を行い、分かったことを日本語で詳しく説明してください。\n" + "・できるだけ多くの情報源(可能なら10件以上)を参照し、それぞれの情報源の内容に触れること。\n" + "・定義、具体例、解説、関連する話題など、複数の観点から説明すること。\n" + "・日本語の情報源を優先して参照すること。\n" + "・箇条書きで、1項目につき2〜3文で書くこと。";
-  const extraInstruction = "「" + query + "」について、先ほどとは別の観点(具体例、事例、統計、関連制度、実務上の扱いなど)から" + "さらにGoogle検索を行い、新しい情報源の内容を日本語で詳しく説明してください。箇条書きで、1項目につき2〜3文で書くこと。";
+  const mainInstruction = "「" + query + "」についてGoogle検索を行い、調べて分かったことを日本語で詳しく説明してください。\n" + "・できるだけ多くの情報源(可能なら12件以上)を参照し、それぞれの情報源に書かれている内容を具体的に述べること。\n" + "・定義や基本的な説明、具体例、背景や経緯、関連する制度や議論、注意点など、複数の観点を網羅すること。\n" + "・一般論で済ませず、数値・固有名詞・事例など具体的な情報を含めること。\n" + "・信頼できる日本語の情報源(公的機関、報道機関、専門サイト、辞典など)を優先して参照すること。\n" + "・箇条書きで、1項目につき2〜4文で書くこと。";
+  const extraInstruction = "「" + query + "」について、先ほどとは別の観点(具体的な事例、統計データ、関連する制度や法令、" + "実務上の取り扱い、異なる立場からの見解、最近の動向など)からさらにGoogle検索を行い、" + "新しい情報源の内容を日本語で詳しく説明してください。\n" + "・先ほど挙げたものとは異なる情報源を中心に、できるだけ多く参照すること。\n" + "・箇条書きで、1項目につき2〜4文で、具体的な情報を含めて書くこと。";
   const models = Array.from(new Set([settings.geminiModel || "gemini-2.5-flash", "gemini-2.5-flash", "gemini-2.0-flash"]));
   let usedModel = null;
   let lastErr = null;
@@ -506,15 +561,21 @@ async function callGeminiSearch(query, settings) {
         throw e;
       }
     }
-    return [];
+    return {
+      sources: [],
+      overview: ""
+    };
   };
 
   // 段階1: 検索(件数が少なければ観点を変えてもう一度)
-  let collected = await runSearch(mainInstruction);
-  if (collected.length < 6) {
+  const first = await runSearch(mainInstruction);
+  let collected = first.sources;
+  let overview = first.overview;
+  if (collected.length < 8) {
     try {
       const more = await runSearch(extraInstruction);
-      collected = collected.concat(more);
+      collected = collected.concat(more.sources);
+      if (more.overview) overview = (overview ? overview + "\n\n" : "") + more.overview;
     } catch (e) {
       if (e.message === "NETWORK_BLOCKED") throw e;
     }
@@ -571,62 +632,49 @@ async function callGeminiSearch(query, settings) {
       verified: true
     }));
   }
-  if (results.length > 0) return results;
+  if (results.length > 0) {
+    results.overview = overview; // 検索全体の要点(配列に添えて返す)
+    return results;
+  }
   if (lastErr) throw lastErr;
-  return [{
+  const fallback = [{
     title: "Googleで「" + query + "」の検索結果を開く",
     domain: "google.com",
     link: googleSearchUrl(query),
     snippet: "今回は参照元の情報を取得できませんでした。Google検索の結果ページから直接ご確認ください。",
     verified: false
   }];
+  fallback.overview = overview;
+  return fallback;
 }
 
 // --- 生成AI: Gemini API(無料枠) ---
-async function callGemini(prompt, context, settings) {
+// 生成AI。会話履歴を引き継ぎ、思考を有効にして回答精度を高める。
+// 一般的なGeminiの利用と同様、依頼内容をそのまま扱う(レポート作成を前提とした
+// 指示は加えない)。system には最低限の応答品質に関する指示のみを置く。
+async function callGemini(prompt, context, settings, history) {
   if (!settings.geminiKey) throw new Error("NO_KEY");
-  const contentText = prompt; // 一般的なGemini利用と同じ挙動(前提文・本文コンテキストは付与しない)
-  const models = Array.from(new Set([settings.geminiModel || "gemini-2.5-flash", "gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]));
-  const versions = ["v1beta", "v1"];
+  const system = "あなたは有能で誠実なアシスタントです。日本語で回答してください。\n" + "・質問の意図を正確に捉え、要点を押さえたうえで、必要な背景や具体例を含めて十分に詳しく説明すること。\n" + "・事実関係は正確に述べ、確信が持てない事柄は断定せず、その旨を明示すること。\n" + "・構成を整え、必要に応じて見出しや箇条書きを用いて読みやすくすること。\n" + "・表面的な一般論で終わらせず、問いに即した具体的な内容を述べること。";
+  const models = Array.from(new Set([settings.geminiModel || "gemini-2.5-flash", "gemini-2.5-flash", "gemini-2.0-flash"]));
   let lastErr = null;
   for (const model of models) {
-    for (const ver of versions) {
-      const url = "https://generativelanguage.googleapis.com/" + ver + "/models/" + model + ":generateContent?key=" + encodeURIComponent(settings.geminiKey);
-      let res;
-      try {
-        res = await fetch(url, {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify({
-            contents: [{
-              parts: [{
-                text: contentText
-              }]
-            }],
-            generationConfig: {
-              maxOutputTokens: 4096,
-              temperature: 0.7
-            }
-          })
-        });
-      } catch (e) {
-        throw new Error("NETWORK_BLOCKED");
-      }
-      let data = {};
-      try {
-        data = await res.json();
-      } catch (e) {}
-      if (data.error) {
-        lastErr = new Error("Gemini API: " + (data.error.message || res.status));
-        if (data.error.code === 404 || res.status === 404) continue;
-        throw lastErr;
-      }
-      const parts = data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts;
-      const out = (parts || []).map(p => p.text || "").join("");
+    try {
+      const cand = await geminiCall(settings, model, prompt, {
+        system: system,
+        history: history || [],
+        maxTokens: 8192,
+        temperature: 0.8,
+        thinking: -1 // 動的思考(必要に応じてモデルが推論量を決める)
+      });
+      const parts = cand && cand.content && cand.content.parts;
+      const out = (parts || []).map(p => p.text || "").join("").trim();
       if (out) return out;
       lastErr = new Error("Gemini API: 応答が空でした");
+    } catch (e) {
+      if (e.message === "NETWORK_BLOCKED") throw e;
+      lastErr = e;
+      if (e.code === 404) continue; // モデル名が存在しない場合のみ次を試す
+      throw e;
     }
   }
   throw lastErr || new Error("Gemini API: 呼び出しに失敗しました");
@@ -940,6 +988,8 @@ function SettingsPanel({
   }, /*#__PURE__*/React.createElement("option", {
     value: "gemini-2.5-flash"
   }, "gemini-2.5-flash(推奨・無料枠)"), /*#__PURE__*/React.createElement("option", {
+    value: "gemini-2.5-pro"
+  }, "gemini-2.5-pro(高精度・無料枠は上限が厳しめ)"), /*#__PURE__*/React.createElement("option", {
     value: "gemini-2.5-flash-lite"
   }, "gemini-2.5-flash-lite(軽量・無料枠)"), /*#__PURE__*/React.createElement("option", {
     value: "gemini-2.0-flash"
@@ -1101,10 +1151,12 @@ function StudentEditor({
   const aiProvider = "gemini";
   const [query, setQuery] = useState("");
   const [searchItems, setSearchItems] = useState(null);
+  const [searchOverview, setSearchOverview] = useState("");
   const [searchErr, setSearchErr] = useState("");
   const [searching, setSearching] = useState(false);
   const [aiPrompt, setAiPrompt] = useState("");
   const [aiResult, setAiResult] = useState("");
+  const [aiChat, setAiChat] = useState([]); // 会話履歴(一般的なGeminiと同様に文脈を引き継ぐ)
   const [aiErr, setAiErr] = useState("");
   const [aiLoading, setAiLoading] = useState(false);
   const [submitStatus, setSubmitStatus] = useState({
@@ -1367,6 +1419,7 @@ function StudentEditor({
     setSearching(true);
     setSearchErr("");
     setSearchItems(null);
+    setSearchOverview("");
     pushEvent({
       type: "search",
       query,
@@ -1375,6 +1428,7 @@ function StudentEditor({
     try {
       const items = await callGeminiSearch(query, settings);
       setSearchItems(items);
+      setSearchOverview(items.overview || "");
       pushEvent({
         type: "searchResult",
         query,
@@ -1404,9 +1458,21 @@ function StudentEditor({
       provider: aiProvider
     });
     try {
-      const r = await callGemini(aiPrompt, text, settings);
+      // 直近の往復を文脈として渡す(追加質問や言い直しが通じるようにする)
+      const history = aiChat.slice(-8);
+      const r = await callGemini(aiPrompt, text, settings, history);
       setAiResult(r || "(空の応答)");
-      if (r) aiOutputsRef.current.push(r); // 部分コピペ検出のため回答を記憶
+      if (r) {
+        aiOutputsRef.current.push(r); // 部分コピペ検出のため回答を記憶
+        setAiChat(history.concat([{
+          role: "user",
+          text: aiPrompt
+        }, {
+          role: "model",
+          text: r
+        }]));
+        setAiPrompt("");
+      }
       pushEvent({
         type: "aiResult",
         prompt: aiPrompt,
@@ -1681,7 +1747,16 @@ function StudentEditor({
     className: "block mt-2 text-sky-700 underline"
   }, "API設定を開く")), searchItems && searchItems.length === 0 && /*#__PURE__*/React.createElement("p", {
     className: "text-sm text-stone-400"
-  }, "結果が見つかりませんでした。"), searchItems && searchItems.map((it, i) => /*#__PURE__*/React.createElement(SearchResultCard, {
+  }, "結果が見つかりませんでした。"), searchOverview && /*#__PURE__*/React.createElement("div", {
+    className: "border border-sky-200 bg-sky-50 rounded-lg p-3"
+  }, /*#__PURE__*/React.createElement("p", {
+    className: "text-xs font-semibold text-sky-800 mb-1"
+  }, "検索の要点"), /*#__PURE__*/React.createElement("p", {
+    className: "text-xs text-stone-700 whitespace-pre-wrap leading-relaxed max-h-56 overflow-auto"
+  }, searchOverview), /*#__PURE__*/React.createElement("button", {
+    onClick: () => insertToReport(searchOverview),
+    className: "mt-2 text-xs text-amber-700 border border-amber-300 rounded px-2 py-1 hover:bg-amber-50"
+  }, "要点を本文に引用(コピペとして記録)")), searchItems && searchItems.map((it, i) => /*#__PURE__*/React.createElement(SearchResultCard, {
     key: i,
     item: it,
     onQuote: insertToReport
@@ -1691,9 +1766,18 @@ function StudentEditor({
     className: "text-sm text-stone-400 bg-stone-50 rounded-lg p-3"
   }, "Gemini検索(Google検索グラウンディング)で実際の検索結果を表示します。検索の実行はすべてログに記録されます。"))) : /*#__PURE__*/React.createElement("div", {
     className: "p-4 flex flex-col gap-3 flex-1"
-  }, /*#__PURE__*/React.createElement("textarea", {
+  }, aiChat.length > 0 && /*#__PURE__*/React.createElement("div", {
+    className: "flex items-center justify-between text-xs text-stone-400"
+  }, /*#__PURE__*/React.createElement("span", null, "会話を継続中(", Math.floor(aiChat.length / 2), "往復・文脈を引き継ぎます)"), /*#__PURE__*/React.createElement("button", {
+    onClick: () => {
+      markInternalNavigation();
+      setAiChat([]);
+      setAiResult("");
+    },
+    className: "border border-stone-200 rounded px-2 py-0.5 hover:bg-stone-50"
+  }, "新しい会話")), /*#__PURE__*/React.createElement("textarea", {
     className: "border border-stone-200 rounded-lg px-3 py-2 text-sm outline-none focus:border-violet-400 resize-none h-20",
-    placeholder: "AIへの依頼(例: 序論の構成案を出して)",
+    placeholder: aiChat.length > 0 ? "続けて質問できます" : "AIへの依頼(例: 序論の構成案を出して)",
     value: aiPrompt,
     onChange: e => setAiPrompt(e.target.value)
   }), /*#__PURE__*/React.createElement("div", {
